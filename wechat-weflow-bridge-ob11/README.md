@@ -105,6 +105,8 @@ Web 控制面板：`http://127.0.0.1:8766`
 ## 工作原理
 
 1. **接收消息**：连接 WeFlow SSE 推送，实时接收微信消息
+
+> WeFlow 的 SSE 同一条通道还会推送 `event: ready` 与 `message.revoke`。桥接只处理 `event=message.new` 且带 `rawid` 的事件，撤回通知不会触发 AI 回复。
 2. **缓冲合并**：多消息缓冲 N 秒后合并推送
 3. **OneBot 推送**：将合并后的消息转为 OneBot v11 消息事件，通过 WebSocket 推给 AstrBot
 4. **AI 处理**：AstrBot 通过 aiocqhttp 接收事件，经过插件流水线处理后生成回复

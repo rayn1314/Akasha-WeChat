@@ -28,6 +28,13 @@ from ob_protocol import push_event, make_message_event
 log = logging.getLogger("ob11-bridge")
 
 
+def _effective_port(parsed) -> int:
+    """取 URL 的有效端口（未显式指定时按 scheme 推断）。"""
+    if parsed.port:
+        return parsed.port
+    return 443 if parsed.scheme == "https" else 80
+
+
 def _is_unsafe_ip(ip) -> bool:
     """判断地址是否为内网/链路本地/回环/未指定（含 IPv4-mapped IPv6）。"""
     candidates = [ip]
@@ -41,13 +48,15 @@ def _is_unsafe_ip(ip) -> bool:
 
 
 def _is_safe_media_url(url: str) -> bool:
-    """校验图片下载 URL，防止 SSRF：仅允许 http/https，且目标不是内网保留地址。
+    """校验图片下载 URL，防止 SSRF。
 
-    允许 localhost/127.0.0.1（WeFlow 可能提供本地代理 URL）；
-    拒绝私网、链路本地（含云元数据 169.254.x）、回环与未指定地址。
+    WeFlow 的 mediaUrl 固定是它自己的 /api/v1/media 地址，因此优先信任
+    与 weflow_base_url 同 host:port 的地址（含局域网部署）；其余地址只允许
+    http/https 公网目标，拒绝私网、链路本地（云元数据）、回环与未指定地址。
     """
     try:
         parsed = urlparse(url)
+        weflow = urlparse(config.WE_FLOW_BASE_URL)
     except Exception:
         return False
     if parsed.scheme not in ("http", "https"):
@@ -55,6 +64,9 @@ def _is_safe_media_url(url: str) -> bool:
     host = parsed.hostname or ""
     if not host:
         return False
+    # 与 WeFlow 同源：这是它自己生成的媒体地址，直接信任
+    if host == weflow.hostname and _effective_port(parsed) == _effective_port(weflow):
+        return True
     if host in ("localhost", "127.0.0.1", "::1"):
         return True
     try:
@@ -69,6 +81,18 @@ def _is_safe_media_url(url: str) -> bool:
         if _is_unsafe_ip(ip):
             return False
     return bool(infos)
+
+
+def _should_accept_push_event(data: dict) -> bool:
+    """只接受 message.new 且带 rawid 的 SSE 事件。
+
+    WeFlow 在同一 SSE 通道还会推送 event: ready 与 message.revoke；
+    撤回通知的 content 是「对方撤回了一条消息…」，若不过滤会被当成
+    用户消息交给 AI 回复。
+    """
+    if data.get("event", "message.new") != "message.new":
+        return False
+    return bool(str(data.get("rawid", "")).strip())
 
 
 # ============ 桥接核心 ============
@@ -371,10 +395,13 @@ class WeFlowBridge:
                         continue
                     try:
                         data = json.loads(data_str)
+                        # 忽略 ready / message.revoke 等非新消息事件
+                        if not _should_accept_push_event(data):
+                            continue
                         msg_time = data.get("timestamp", 0)
                         if msg_time < self.start_timestamp:
                             continue
-                        raw_id = data.get("rawid", "")
+                        raw_id = str(data.get("rawid", "")).strip()
                         if raw_id in self.processed_ids:
                             continue
                         self.processed_ids.add(raw_id)
