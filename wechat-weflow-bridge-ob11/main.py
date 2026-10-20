@@ -4,7 +4,6 @@
 负责桥接的启动、停止、主循环重连逻辑，以及命令行入口。
 """
 
-import json
 import logging
 import os
 import sys
@@ -18,7 +17,7 @@ import config
 from senders import create_sender
 from ob_client import _run_ob_client
 from bridge_core import WeFlowBridge
-from web_panel import WebHandler, PAGE
+from web_panel import WebHandler
 from http.server import HTTPServer
 
 log = logging.getLogger("ob11-bridge")
@@ -109,15 +108,22 @@ def _bridge_loop():
         state.running = False
         return
 
+    reconnect_delay = 5
     while state.running:
         try:
-            bridge.listen_sse()
+            ok = bridge.listen_sse()
         except Exception as e:
             log.error(f"SSE: {e}")
+            ok = False
         if not state.running:
             break
-        log.warning("⚠️ SSE 断开，10s 后重连")
-        for _ in range(10):
+        # 指数退避：连接阶段失败/读超时则翻倍等待（5s→60s 封顶），曾成功则快速重连
+        if ok:
+            reconnect_delay = 5
+        else:
+            reconnect_delay = min(reconnect_delay * 2, 60)
+        log.warning(f"⚠️ SSE 断开，{reconnect_delay}s 后重连")
+        for _ in range(reconnect_delay):
             if not state.running:
                 break
             time.sleep(1)
@@ -153,7 +159,6 @@ if __name__ == "__main__":
     def pid_exists(pid):
         try:
             import ctypes
-            from ctypes import wintypes
             h = ctypes.windll.kernel32.OpenProcess(0x0400, False, pid)
             if h:
                 ctypes.windll.kernel32.CloseHandle(h)

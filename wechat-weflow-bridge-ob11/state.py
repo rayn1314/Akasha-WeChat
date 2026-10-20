@@ -7,14 +7,14 @@ AI 服务：AstrBot 通过 aiocqhttp (OneBot v11) 接入
 
 架构：
   WeFlow ──SSE──→ bridge.py ──WS 客户端──→ AstrBot (aiocqhttp 服务端)
-                   ↑ 连接 ws://127.0.0.1:19777  ↑ 监听端口，等待客户端连入
+                   ↑ 连接 ws://127.0.0.1:11229/ws  ↑ 监听端口，等待客户端连入
                    发送 OneBot 事件             返回 API 响应
 """
 
 # 共享状态：所有模块通过 import state 访问这些变量
 import hashlib
 import threading
-from typing import Optional
+from collections import OrderedDict
 
 # ============ 状态控制 ============
 
@@ -43,7 +43,18 @@ def _wxid_to_int(wxid: str) -> int:
 bridge_instance = None
 bridge_lock = threading.Lock()
 sender_instance = None
-_ob_id_to_contact: dict[int, str] = {}  # OneBot user_id/group_id → 微信联系名
+_ob_id_to_contact: "OrderedDict[int, str]" = OrderedDict()  # OneBot user_id/group_id → 微信联系名
+_OB_ID_TO_CONTACT_MAX = 5000  # 映射上限，防止长跑内存膨胀
+
+
+def record_ob_id_contact(ob_id: int, contact: str) -> None:
+    """记录 OneBot ID → 微信联系名映射，LRU 有界：超出上限时淘汰最旧条目。"""
+    _ob_id_to_contact[ob_id] = contact
+    _ob_id_to_contact.move_to_end(ob_id)
+    while len(_ob_id_to_contact) > _OB_ID_TO_CONTACT_MAX:
+        _ob_id_to_contact.popitem(last=False)
+
+
 ob_client_started = False
 
 # 记录机器人最近发出的文本（内容 → 发送时间戳），供 bridge_core 做自回复去重

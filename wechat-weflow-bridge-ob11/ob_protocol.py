@@ -5,18 +5,17 @@ OneBot v11 协议处理模块。
 - make_message_event() — 构造 OneBot 消息事件 JSON
 - push_event() — 通过 WebSocket 推送事件给 AstrBot
 - _handle_ob_api() — 处理 AstrBot 发来的 API 请求（send_msg 等）
-- _extract_text() — 从 OneBot message 段提取纯文本
+- _decode_base64_image() — 解码 base64 图片为临时文件
 """
 
 import asyncio
 import base64
+import binascii
 import json
 import os
 import tempfile
 import time
 import logging
-
-import requests
 
 import state
 import config
@@ -105,18 +104,11 @@ async def _handle_ob_api(data: dict):
                     except Exception as e:
                         log.warning(f"[OB11] base64 图片解码失败: {e}")
                 else:
-                    # 文件名模式：在附件目录找
+                    # 文件名模式：在附件目录内查找（防路径穿越）
                     if config.ASTRBOT_ATTACHMENTS:
-                        candidates = [
-                            os.path.join(config.ASTRBOT_ATTACHMENTS, file_val),
-                            os.path.join(config.ASTRBOT_ATTACHMENTS, "wechat_images", file_val),
-                        ]
-                        for p in candidates:
-                            if os.path.exists(p):
-                                img_path = p
-                                break
+                        img_path = _safe_attachment_path(file_val)
                         if not img_path:
-                            log.warning(f"[OB11] 图片文件未找到: {file_val}")
+                            log.warning(f"[OB11] 图片文件未找到或路径被拒绝: {file_val}")
 
                 if img_path:
                     try:
@@ -143,32 +135,32 @@ async def _handle_ob_api(data: dict):
     # 注意：API 响应已在函数开头统一发送，此处不再重复
 
 
-def _extract_text(message: list) -> str:
-    """从 OneBot message 段中提取可发送的文本。"""
-    text_parts = []
-    for seg in message:
-        if isinstance(seg, dict):
-            t = seg.get("type", "")
-            d = seg.get("data", {})
-            if t == "text":
-                text_parts.append(d.get("text", ""))
-            elif t == "image":
-                text_parts.append("[图片]")
-            elif t == "face":
-                text_parts.append("[表情]")
-            elif t == "record":
-                text_parts.append("[语音]")
-            elif t == "video":
-                text_parts.append("[视频]")
-            elif t == "reply":
-                if d.get("text"):
-                    text_parts.append(f'"{d["text"]}"')
-            elif t == "at":
-                text_parts.append(f"@{d.get('qq', d.get('name', ''))}")
-            else:
-                # 其他未知类型也尝试提取文本
-                text_parts.append(d.get("text", ""))
-    return "".join(text_parts).strip()
+def _safe_attachment_path(file_val: str) -> str | None:
+    """将 AstrBot 传来的图片文件名解析为附件目录内的安全绝对路径。
+
+    支持 file:// 前缀、绝对路径与相对路径；解析后必须位于
+    ASTRBOT_ATTACHMENTS 目录内，否则拒绝，防止路径穿越读取任意文件。
+    """
+    if not config.ASTRBOT_ATTACHMENTS:
+        return None
+    base_dir = os.path.realpath(config.ASTRBOT_ATTACHMENTS)
+
+    candidate = file_val
+    if candidate.startswith("file://"):
+        candidate = candidate[len("file://"):]
+    candidate = os.path.normpath(candidate)
+
+    if os.path.isabs(candidate):
+        full = os.path.realpath(candidate)
+    else:
+        full = os.path.realpath(os.path.join(base_dir, candidate))
+
+    if full != base_dir and not full.startswith(base_dir + os.sep):
+        log.warning(f"[OB11] 拒绝附件目录外的图片路径: {file_val}")
+        return None
+    if not os.path.exists(full):
+        return None
+    return full
 
 
 # ============ OneBot 协议处理 ============
@@ -222,11 +214,27 @@ def push_event(event: dict) -> bool:
         return False
 
 
+def _sniff_image_ext(img_data: bytes) -> str:
+    """根据文件头魔数推断图片扩展名，未知格式回退 .png。"""
+    if img_data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if img_data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if img_data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if img_data[:4] == b"RIFF" and img_data[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"
+
+
 def _decode_base64_image(b64_data: str) -> str | None:
-    """在线程池中执行：解码 base64 图片并保存为临时文件。"""
-    import tempfile
-    img_data = base64.b64decode(b64_data)
-    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    """在线程池中执行：解码 base64 图片并保存为临时文件，扩展名按真实格式推断。"""
+    try:
+        img_data = base64.b64decode(b64_data)
+    except (binascii.Error, ValueError) as e:
+        log.warning(f"[OB11] base64 解码失败: {e}")
+        return None
+    tmp = tempfile.NamedTemporaryFile(suffix=_sniff_image_ext(img_data), delete=False)
     tmp.write(img_data)
     tmp.close()
     return tmp.name

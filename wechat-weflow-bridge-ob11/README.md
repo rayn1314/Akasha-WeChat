@@ -8,7 +8,7 @@
 微信 ←→ WeFlow ──SSE──→ bridge.py ──WebSocket 客户端──→ AstrBot
                             ↑                              ↑
                           OneBot v11 事件             aiocqhttp 服务端
-                          (ws://127.0.0.1:19777)    (0.0.0.0:19777)
+                          (ws://127.0.0.1:11229/ws)  (0.0.0.0:11229)
 ```
 
 bridge 以 WebSocket **客户端**连接 AstrBot 的 aiocqhttp **服务端**，与 NapCatQQ 连接 AstrBot 的方式完全一致。
@@ -49,7 +49,9 @@ cp config.example.json config.json
     "buffer_seconds": 5,
     "web_port": 8766,
     "group_reply_mode": "mention",
-    "astrbot_ob_url": "ws://127.0.0.1:19777"
+    "astrbot_ob_url": "ws://127.0.0.1:11229/ws",
+    "astrbot_ob_token": "",
+    "web_panel_token": ""
 }
 ```
 
@@ -63,14 +65,14 @@ cp config.example.json config.json
     "type": "aiocqhttp",
     "enable": true,
     "ws_reverse_host": "0.0.0.0",
-    "ws_reverse_port": 19777,
-    "ws_reverse_token": ""
+    "ws_reverse_port": 11229,
+    "ws_reverse_token": "与 astrbot_ob_token 相同的随机串（可选）"
 }
 ```
 
-> 如果 AstrBot 运行在 Docker 中，需要将端口 19777 映射到宿主机：
+> 如果 AstrBot 运行在 Docker 中，需要将端口 11229 映射到宿主机：
 > ```
-> -p 19777:19777
+> -p 11229:11229
 > ```
 
 重启 AstrBot。
@@ -97,6 +99,8 @@ Web 控制面板：`http://127.0.0.1:8766`
 | `web_port` | Web 控制面板端口 |
 | `group_reply_mode` | `"mention"`（仅 @回复）或 `"all"`（全部回复） |
 | `astrbot_ob_url` | AstrBot aiocqhttp WebSocket 服务端地址 |
+| `astrbot_ob_token` | 与 AstrBot `ws_reverse_token` 一致；配置后连接携带 `Authorization: Bearer` |
+| `web_panel_token` | Web 面板访问令牌；留空则不启用认证（仅建议本机使用） |
 
 ## 工作原理
 

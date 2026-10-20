@@ -8,10 +8,8 @@ OneBot WebSocket 客户端模块。
 import asyncio
 import json
 import logging
-import threading
 
 import websockets
-from websockets.asyncio.server import ServerConnection, serve
 
 import state
 import config
@@ -41,13 +39,17 @@ async def _ob_client_main():
     while state.running:
         try:
             log.info(f"[OB11] 正在连接 AstrBot: {config.ASTRBOT_OB_URL}")
+            headers = {
+                "X-Self-ID": str(state._self_id_int),
+                "X-Client-Role": "Universal",
+                "User-Agent": "OneBot/11",
+            }
+            # 若配置了 astrbot_ob_token，按 OneBot v11 规范携带 Authorization: Bearer <token>
+            if config.ASTRBOT_OB_TOKEN:
+                headers["Authorization"] = f"Bearer {config.ASTRBOT_OB_TOKEN}"
             async with websockets.connect(
                 config.ASTRBOT_OB_URL,
-                additional_headers={
-                    "X-Self-ID": str(state._self_id_int),
-                    "X-Client-Role": "Universal",
-                    "User-Agent": "OneBot/11",
-                }
+                additional_headers=headers,
             ) as ws:
                 state._ob_ws = ws
                 state._ob_ws_ready.set()

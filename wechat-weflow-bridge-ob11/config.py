@@ -5,7 +5,6 @@
 import json
 import os
 import logging
-import threading
 
 # ============ 配置 ============
 
@@ -30,7 +29,12 @@ WEB_PORT = config.get("web_port", 8766)
 GROUP_REPLY_MODE = config.get("group_reply_mode", "mention")  # "mention" / "all"
 
 # AstrBot OneBot 连接配置（bridge 作为 WebSocket 客户端连 AstrBot 的 aiocqhttp 服务端）
-ASTRBOT_OB_URL = config.get("astrbot_ob_url", "ws://127.0.0.1:19777")
+ASTRBOT_OB_URL = config.get("astrbot_ob_url", "ws://127.0.0.1:11229/ws")
+# AstrBot aiocqhttp 反向 WS 服务端配置的 access_token（需与 AstrBot 端保持一致）
+ASTRBOT_OB_TOKEN = config.get("astrbot_ob_token", "")
+
+# Web 控制面板访问令牌（留空 = 不启用面板认证，仅限本机访问）
+WEB_PANEL_TOKEN = config.get("web_panel_token", "")
 
 # 图片描述配置（支持 ollama 或 openai 兼容 API）
 IMAGE_CAPTION_PROVIDER = config.get("image_caption_provider", "ollama")  # "ollama" / "openai"
@@ -55,3 +59,12 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("ob11-bridge")
+
+# ============ 安全提示 ============
+
+if not WEB_PANEL_TOKEN:
+    log.warning("⚠️ 未配置 web_panel_token，Web 控制面板（含配置与 access_token）无需认证即可访问。"
+                "仅建议在本机可信环境使用；如需保护请修改 config.json 添加 web_panel_token。")
+if ASTRBOT_OB_TOKEN:
+    log.info("🔑 已配置 astrbot_ob_token，连接 AstrBot 时将携带 Authorization 头。"
+             "请确认 AstrBot aiocqhttp 服务端也配置了相同的 access_token。")

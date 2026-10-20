@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import re
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler
 
 import state
 import config
@@ -40,6 +40,9 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:linear-gradient(
 .sidebar .nav-item:hover{background:rgba(240,98,146,0.08);color:#d4567a}
 .sidebar .nav-item.active{background:linear-gradient(135deg,#f48fb1,#f06292);color:#fff;box-shadow:0 4px 12px rgba(240,98,146,0.25)}
 .sidebar .nav-item.active:hover{color:#fff}
+.sidebar .token-box{width:100px;margin-top:auto;padding:0 6px}
+.sidebar .token-box input{width:100%;padding:6px 8px;border:1.5px solid #f0ced9;border-radius:10px;font-size:11px;outline:none;background:#fff;color:#4a4a4a}
+.sidebar .token-box input:focus{border-color:#f06292;box-shadow:0 0 0 3px rgba(240,98,146,0.08)}
 
 /* ===== 内容区 ===== */
 .content{flex:1;padding:28px 32px;overflow-y:auto;display:flex;flex-direction:column;gap:16px;height:100vh}
@@ -134,6 +137,10 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:linear-gradient(
   <button class="nav-item" data-tab="settings" onclick="switchTab('settings')">
     <span>基础设置</span>
   </button>
+  <div class="token-box">
+    <input type="password" id="tokenInput" placeholder="面板Token" autocomplete="off">
+    <button class="btn btn-outline" style="padding:4px 6px;font-size:11px;width:100%;margin-top:4px" onclick="saveToken()">保存 Token</button>
+  </div>
 </div>
 
 <!-- ===== 内容区 ===== -->
@@ -195,6 +202,25 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// ===== 面板 Token =====
+function getToken() {
+  return localStorage.getItem('panel_token') || '';
+}
+
+function saveToken() {
+  localStorage.setItem('panel_token', document.getElementById('tokenInput').value.trim());
+  toast('Token 已保存', 'success');
+  refreshDashboard();
+}
+
+function apiFetch(path, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  var token = getToken();
+  if (token) opts.headers['X-Panel-Token'] = token;
+  return fetch(path, opts);
+}
+
 function toast(msg, type) {
   var t = document.getElementById('toast');
   t.textContent = msg;
@@ -222,7 +248,16 @@ function switchTab(name) {
 var modeMap = {'mention':'仅@回复','all':'全部回复','batch':'批处理'};
 
 function refreshDashboard() {
-  fetch('/status').then(function(r){return r.json()}).then(function(s){
+  apiFetch('/status').then(function(r){return r.json()}).then(function(s){
+    if (s.auth_required && !s.auth_ok) {
+      document.getElementById('statusText').textContent = '需要 Token';
+      document.getElementById('bridgeStatus').textContent = '-';
+      document.getElementById('obStatus').textContent = '-';
+      document.getElementById('weflowStatus').textContent = '-';
+      document.getElementById('modeStatus').textContent = '-';
+      document.getElementById('log').textContent = '请在左侧输入面板 Token 后保存';
+      return;
+    }
     var st = document.getElementById('bridgeStatus');
     if (!s.running) { st.textContent='未运行'; st.style.color='#bdbdbd';
     } else if (s.paused) { st.textContent='已暂停'; st.style.color='#ff9800';
@@ -257,17 +292,29 @@ function refreshDashboard() {
 }
 
 function action(cmd) {
-  fetch('/' + cmd, {method:'POST'}).then(function(){setTimeout(refreshDashboard,500)});
+  apiFetch('/' + cmd, {method:'POST'}).then(function(r){
+    if (r.status === 401) { toast('Token 无效或缺失', 'error'); return; }
+    setTimeout(refreshDashboard,500);
+  });
 }
 
 document.getElementById('btnToggleMode').onclick = function(){
-  fetch('/mode', {method:'POST'}).then(function(){setTimeout(refreshDashboard,500)});
+  apiFetch('/mode', {method:'POST'}).then(function(r){
+    if (r.status === 401) { toast('Token 无效或缺失', 'error'); return; }
+    setTimeout(refreshDashboard,500);
+  });
 };
 
 // ===== 设置加载 =====
 function loadConfig() {
-  fetch('/api/config').then(function(r){return r.json()}).then(function(cfg){
-    renderConfigForm(cfg);
+  apiFetch('/api/config').then(function(r){
+    if (r.status === 401) {
+      document.getElementById('settingsForm').innerHTML = '<p style="color:#e57373;font-size:13px;">需要有效 Token 才能查看配置</p>';
+      return null;
+    }
+    return r.json();
+  }).then(function(cfg){
+    if (cfg) renderConfigForm(cfg);
   }).catch(function(e){
     document.getElementById('settingsForm').innerHTML = '<p style="color:#e57373;font-size:13px;">加载配置失败: ' + e.message + '</p>';
   });
@@ -345,11 +392,15 @@ function saveConfig() {
     data[key] = val;
   });
 
-  fetch('/api/config', {
+  apiFetch('/api/config', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify(data),
-  }).then(function(r){return r.json()}).then(function(res){
+  }).then(function(r){
+    if (r.status === 401) { showMsg('❌ Token 无效或缺失'); return null; }
+    return r.json();
+  }).then(function(res){
+    if (!res) return;
     if (res.ok) {
       showMsg('✅ 已保存（部分更改需重启生效）');
     } else {
@@ -361,6 +412,7 @@ function saveConfig() {
 }
 
 // ===== 初始化 =====
+document.getElementById('tokenInput').value = getToken();
 refreshDashboard();
 setInterval(refreshDashboard, 3000);
 </script>
@@ -369,8 +421,18 @@ setInterval(refreshDashboard, 3000);
 
 
 class WebHandler(BaseHTTPRequestHandler):
+    def _auth_ok(self) -> bool:
+        """面板认证：未配置 web_panel_token 时放行（仅本机使用），否则校验请求头。"""
+        if not config.WEB_PANEL_TOKEN:
+            return True
+        return self.headers.get("X-Panel-Token", "") == config.WEB_PANEL_TOKEN
+
     def do_GET(self):
         if self.path == "/status":
+            if not self._auth_ok():
+                # 未认证时不返回运行状态与日志
+                self.send_json({"auth_required": True, "auth_ok": False})
+                return
             ob_connected = state._ob_ws is not None and state._ob_ws_ready.is_set()
             weflow_connected = state.bridge_instance is not None and state.bridge_instance._sse_session is not None
             log_lines = []
@@ -390,8 +452,13 @@ class WebHandler(BaseHTTPRequestHandler):
                 "weflow_connected": weflow_connected,
                 "group_reply_mode": state.group_reply_mode,
                 "log": log_text,
+                "auth_required": bool(config.WEB_PANEL_TOKEN),
+                "auth_ok": True,
             })
         elif self.path == "/api/config":
+            if not self._auth_ok():
+                self.send_json({"error": "unauthorized"}, 401)
+                return
             try:
                 with open(config.CONFIG_FILE, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
@@ -406,6 +473,9 @@ class WebHandler(BaseHTTPRequestHandler):
             self.wfile.write(PAGE.encode("utf-8"))
 
     def do_POST(self):
+        if not self._auth_ok():
+            self.send_json({"error": "unauthorized"}, 401)
+            return
         if self.path == "/start":
             from main import _start_bridge
             _start_bridge()

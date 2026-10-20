@@ -11,12 +11,13 @@
 import json
 import logging
 import os
-import queue
 import re
+import socket
+import ipaddress
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
 
@@ -25,6 +26,49 @@ import config
 from ob_protocol import push_event, make_message_event
 
 log = logging.getLogger("ob11-bridge")
+
+
+def _is_unsafe_ip(ip) -> bool:
+    """判断地址是否为内网/链路本地/回环/未指定（含 IPv4-mapped IPv6）。"""
+    candidates = [ip]
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        candidates.append(mapped)
+    return any(
+        c.is_private or c.is_link_local or c.is_loopback or c.is_unspecified
+        for c in candidates
+    )
+
+
+def _is_safe_media_url(url: str) -> bool:
+    """校验图片下载 URL，防止 SSRF：仅允许 http/https，且目标不是内网保留地址。
+
+    允许 localhost/127.0.0.1（WeFlow 可能提供本地代理 URL）；
+    拒绝私网、链路本地（含云元数据 169.254.x）、回环与未指定地址。
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname or ""
+    if not host:
+        return False
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if _is_unsafe_ip(ip):
+            return False
+    return bool(infos)
 
 
 # ============ 桥接核心 ============
@@ -42,7 +86,6 @@ class WeFlowBridge:
         self.chat_histories = defaultdict(list)
         self.contact_map = {}
         self._sse_session = None
-        self._pending_image = {}  # talkerId → {"caption": None|str, "event": threading.Event()}
         self._pending_mention_images = {}  # session_id → {"data": data, "time": timestamp} 先图后文暂存
 
     def should_ignore(self, data):
@@ -269,16 +312,16 @@ class WeFlowBridge:
                                        [{"type": "text", "data": {"text": combined}}],
                                        nickname=sender_name)
 
-        # 记录 user_id → contact 映射，供 API 回复时查找
+        # 记录 user_id → contact 映射，供 API 回复时查找（LRU 有界）
         if is_group:
             group_id = state._wxid_to_int(entry.get("group_name", contact))
-            state._ob_id_to_contact[group_id] = contact
+            state.record_ob_id_contact(group_id, contact)
         else:
-            state._ob_id_to_contact[user_id] = contact
+            state.record_ob_id_contact(user_id, contact)
 
         sent = push_event(event)
-        if sent > 0:
-            log.info(f"✅ 已推送至 {sent} 个 AstrBot 客户端 [{contact}]")
+        if sent:
+            log.info(f"✅ 已推送事件给 AstrBot [{contact}]")
         else:
             log.warning(f"⚠️ 无 AstrBot 客户端在线 [{contact}]")
 
@@ -298,18 +341,23 @@ class WeFlowBridge:
                     timer.start()
                     entry["timer"] = timer
 
-    def listen_sse(self):
-        """连接 WeFlow SSE 推送。"""
+    def listen_sse(self) -> bool:
+        """连接 WeFlow SSE 推送。
+
+        返回 True 表示连接曾成功建立（随后断开/结束，应快速重连）；
+        返回 False 表示连接阶段失败或读超时（应退避后重连）。
+        """
         sse_url = f"{config.WE_FLOW_BASE_URL}/api/v1/push/messages?access_token={config.ACCESS_TOKEN}"
         # 日志中打码 access_token，避免泄露
         log.info(f"连接 WeFlow 推送服务: {config.WE_FLOW_BASE_URL}/api/v1/push/messages?access_token=***")
         headers = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
 
         try:
-            self._sse_session = requests.get(sse_url, headers=headers, stream=True, timeout=None)
+            # 连接超时 5s；读超时 120s，检测静默断连（SSE 正常有心跳，不应长时间无数据）
+            self._sse_session = requests.get(sse_url, headers=headers, stream=True, timeout=(5, 120))
             if self._sse_session.status_code != 200:
                 log.error(f"连接失败: HTTP {self._sse_session.status_code}")
-                return
+                return False
             log.info("✅ 已连接到 WeFlow 推送")
 
             for line in self._sse_session.iter_lines(decode_unicode=True):
@@ -348,13 +396,21 @@ class WeFlowBridge:
 
         except requests.exceptions.ConnectionError:
             log.error("无法连接 WeFlow")
+            return False
+        except requests.exceptions.ReadTimeout:
+            log.warning("SSE 读超时（120s 无数据），触发退避重连")
+            return False
         except Exception as e:
             log.error(f"SSE 异常: {e}")
         finally:
             self._sse_session = None
+        return True
 
     def _fetch_wechat_image(self, talker: str) -> str | None:
         """从 WeFlow REST API 获取最新图片并保存到本地"""
+        if not config.ASTRBOT_ATTACHMENTS:
+            log.error("未配置 astrbot_attachments，无法保存微信图片")
+            return None
         try:
             url = f"{config.WE_FLOW_BASE_URL}/api/v1/messages"
             params = {
@@ -376,6 +432,10 @@ class WeFlowBridge:
             for msg in messages:
                 if msg.get("mediaType") in ("image", "sticker", "emoji") and msg.get("mediaUrl"):
                     media_url = msg["mediaUrl"]
+                    # SSRF 防护：拒绝内网/元数据地址
+                    if not _is_safe_media_url(media_url):
+                        log.warning(f"⚠️ 拒绝非安全图片下载地址（防 SSRF）: {media_url}")
+                        continue
                     sep = "&" if "?" in media_url else "?"
                     dl_url = f"{media_url}{sep}access_token={config.ACCESS_TOKEN}"
 
@@ -412,12 +472,10 @@ class WeFlowBridge:
         session_id = data.get("sessionId", "")
         source_name = data.get("sourceName", "") or "未知"
         group_name = data.get("groupName", "")
-        rawid = data.get("rawid", "")
 
         log.info(f"🖼️ 收到图片: {source_name}" +
                  (f" (群:{group_name})" if group_name else ""))
 
-        talker_id = data.get("talkerId", "") or data.get("sessionId", "")
         is_group = bool(group_name) or "@chatroom" in session_id
 
         # 与 add_to_buffer 相同规则的 buffer key：群聊为 session_id_发言人，私聊为 session_id
@@ -427,10 +485,6 @@ class WeFlowBridge:
             img_buffer_key = f"{session_id_data}_{sender_in_group}"
         else:
             img_buffer_key = session_id_data
-
-        # 注册待处理的图片（ollama 完成前标记为 pending）
-        img_event = threading.Event()
-        self._pending_image[talker_id] = {"caption": None, "event": img_event}
 
         try:
             # 取图 + ollama 描述
@@ -448,8 +502,6 @@ class WeFlowBridge:
 
             # 注入图片描述到缓冲区
             with self.buffer_lock:
-                self._pending_image[talker_id] = {"caption": caption_text, "event": img_event}
-
                 # 批处理模式用群共享 key
                 if is_group and state.group_reply_mode == "batch" and group_name:
                     g_base = re.sub(r'\s*\(\d+\)\s*$', '', group_name).strip()
@@ -507,9 +559,8 @@ class WeFlowBridge:
                     timer.start()
                     self.pending_buffers[img_buffer_key]["timer"] = timer
                     self.pending_buffers[img_buffer_key]["timer_version"] = version
-        finally:
-            # 确保 Event 被设置
-            img_event.set()
+        except Exception as e:
+            log.warning(f"🖼️ 图片消息处理异常: {e}")
 
     def process_emoji_message(self, data):
         """处理表情包消息：尝试下载图片并描述，失败则保留原文转发"""
