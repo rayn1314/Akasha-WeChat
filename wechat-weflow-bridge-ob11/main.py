@@ -34,9 +34,14 @@ def _start_bridge():
     state.paused.clear()
     state.sender_instance = create_sender()
 
-    if not state.ob_client_started:
+    # OB 客户端线程可能因 WeFlow 故障导致 running=False 而退出；按线程存活判断，
+    # 保证 Web 面板重启 / supervisor 自动 /start 时能恢复 AstrBot 连接。
+    if (not state.ob_client_started
+            or state.ob_client_thread is None
+            or not state.ob_client_thread.is_alive()):
         t = threading.Thread(target=_run_ob_client, daemon=True, name="ob11-client")
         t.start()
+        state.ob_client_thread = t
         state.ob_client_started = True
 
     state.bridge_thread = threading.Thread(target=_bridge_loop, daemon=True, name="bridge")
@@ -75,6 +80,7 @@ def _stop_bridge():
 
     # 重置启动标记，让下次 start 能重新拉起 WebSocket 客户端线程
     state.ob_client_started = False
+    state.ob_client_thread = None
     state._ob_ws_loop = None
 
     log.info("[Web] 已停止")
@@ -102,10 +108,14 @@ def _bridge_loop():
         elif r.status_code == 401:
             log.error("❌ Access Token 无效")
             state.running = False
+            with state.bridge_lock:
+                state.bridge_instance = None
             return
     except requests.exceptions.ConnectionError:
         log.error("❌ 无法连接 WeFlow")
         state.running = False
+        with state.bridge_lock:
+            state.bridge_instance = None
         return
 
     reconnect_delay = 5

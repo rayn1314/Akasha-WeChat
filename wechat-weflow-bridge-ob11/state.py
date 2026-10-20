@@ -56,6 +56,7 @@ def record_ob_id_contact(ob_id: int, contact: str) -> None:
 
 
 ob_client_started = False
+ob_client_thread = None
 
 # 记录机器人最近发出的文本（内容 → 发送时间戳），供 bridge_core 做自回复去重
 sent_recently: dict = {}
